@@ -1,11 +1,11 @@
 """
 VCP Scanner — screaminge.co.uk
 Runs every 30 minutes while the US market is open.
-Sends Telegram alerts on breakouts and uploads results.html via FTP.
 """
 
 import yfinance as yf
 import pandas as pd
+import numpy as np
 import time
 import requests
 import logging
@@ -15,13 +15,13 @@ from ftplib import FTP
 from zoneinfo import ZoneInfo
 
 # ─────────────────────────────────────────
-#  SETTINGS  — fill these in
+#  SETTINGS
 # ─────────────────────────────────────────
 
 BATCH_SIZE          = 100
-MIN_WEEKS           = 40
-MAX_PIVOT_DISTANCE  = 0.08
-MIN_DOLLAR_VOLUME   = 20_000_000
+MIN_WEEKS           = 30           # relaxed from 40
+MAX_PIVOT_DISTANCE  = 0.15         # relaxed from 0.08 — within 15% of pivot
+MIN_DOLLAR_VOLUME   = 1_000_000    # relaxed from 20M — catches mid/small caps
 SCAN_INTERVAL_MINS  = 30
 
 TELEGRAM_BOT_TOKEN  = "YOUR_BOT_TOKEN"
@@ -64,18 +64,18 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────
 
 def market_is_open():
-    et = ZoneInfo("America/New_York")
+    et  = ZoneInfo("America/New_York")
     now = datetime.now(et)
     if now.weekday() >= 5:
         return False
-    market_open  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
-    market_close = now.replace(hour=16, minute=0,  second=0, microsecond=0)
-    return market_open <= now <= market_close
+    open_  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
+    close_ = now.replace(hour=16, minute=0,  second=0, microsecond=0)
+    return open_ <= now <= close_
 
 
 def seconds_until_open():
-    et = ZoneInfo("America/New_York")
-    now = datetime.now(et)
+    et        = ZoneInfo("America/New_York")
+    now       = datetime.now(et)
     candidate = now.replace(hour=9, minute=30, second=0, microsecond=0)
     if candidate <= now:
         candidate += timedelta(days=1)
@@ -130,22 +130,27 @@ def load_spy():
     return spy
 
 # ─────────────────────────────────────────
-#  HELPERS — extract a clean single-ticker DataFrame from a batch download
+#  EXTRACT SINGLE TICKER FROM BATCH
 # ─────────────────────────────────────────
 
 def extract_ticker(raw, symbol, batch):
-    if len(batch) == 1:
-        df = raw.copy()
+    try:
+        if len(batch) == 1:
+            df = raw.copy()
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            return df
+        if not isinstance(raw.columns, pd.MultiIndex):
+            return None
+        top = raw.columns.get_level_values(0)
+        if symbol not in top:
+            return None
+        df = raw[symbol].copy()
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         return df
-    if isinstance(raw.columns, pd.MultiIndex):
-        if symbol not in raw.columns.get_level_values(0):
-            return None
-        df = raw[symbol].copy()
-        df.columns = df.columns.get_level_values(0) if isinstance(df.columns, pd.MultiIndex) else df.columns
-        return df
-    return None
+    except Exception:
+        return None
 
 # ─────────────────────────────────────────
 #  FILTERS
@@ -153,93 +158,148 @@ def extract_ticker(raw, symbol, batch):
 
 def relative_strength(df, spy):
     try:
-        stock_ret = float(df["Close"].iloc[-1]) / float(df["Close"].iloc[-26])
-        spy_ret   = float(spy["Close"].iloc[-1]) / float(spy["Close"].iloc[-26])
-        return stock_ret / spy_ret if spy_ret else 0.0
+        sr = float(df["Close"].iloc[-1])  / float(df["Close"].iloc[-26])
+        br = float(spy["Close"].iloc[-1]) / float(spy["Close"].iloc[-26])
+        return sr / br if br else 0.0
     except Exception:
         return 0.0
 
 
 def liquidity_ok(df):
-    dollar_vol = (df["Close"] * df["Volume"]).tail(20).mean()
-    return float(dollar_vol) > MIN_DOLLAR_VOLUME
+    try:
+        dollar_vol = (df["Close"] * df["Volume"]).tail(20).mean()
+        return float(dollar_vol) > MIN_DOLLAR_VOLUME
+    except Exception:
+        return False
 
 
 def stage2(df):
-    close = df["Close"]
-    ma10  = close.rolling(10).mean()
-    ma40  = close.rolling(40).mean()
-    if ma40.dropna().shape[0] < 40:
+    """
+    Stock must be in a Stage 2 uptrend:
+    price > 10wk MA > 30wk MA, and 30wk MA trending up.
+    Relaxed from 40wk to 30wk MA.
+    """
+    try:
+        close = df["Close"]
+        ma10  = close.rolling(10).mean()
+        ma30  = close.rolling(30).mean()
+        if ma30.dropna().shape[0] < 20:
+            return False
+        return (
+            float(close.iloc[-1]) > float(ma10.iloc[-1])
+            and float(ma10.iloc[-1]) > float(ma30.iloc[-1])
+            and float(ma30.iloc[-1]) > float(ma30.iloc[-6])
+        )
+    except Exception:
         return False
-    return (
-        float(close.iloc[-1]) > float(ma10.iloc[-1])
-        and float(ma10.iloc[-1]) > float(ma40.iloc[-1])
-        and float(ma40.iloc[-1]) > float(ma40.iloc[-8])
-    )
 
 
 def prior_uptrend(df):
-    closes = df["Close"].tail(40)
-    low    = float(closes.min())
-    high   = float(closes.max())
-    return (high - low) / low > 0.20 if low > 0 else False
+    """At least 15% move off lows in past 26 weeks. Relaxed from 20%."""
+    try:
+        closes = df["Close"].tail(26)
+        low    = float(closes.min())
+        high   = float(closes.max())
+        return (high - low) / low > 0.15 if low > 0 else False
+    except Exception:
+        return False
 
 
 def detect_vcp(df):
-    bars         = df.tail(10)
-    ranges       = (bars["High"] - bars["Low"]).values
-    contractions = sum(1 for i in range(1, len(ranges)) if ranges[i] < ranges[i - 1])
-    if contractions < 3:
-        return False, contractions, None
-    pivot = float(df["High"].tail(5).max())
-    return True, contractions, pivot
+    """
+    Core VCP detection — looks for volatility contraction over recent weeks.
+
+    Method: split the last 15 weeks into three 5-week windows.
+    Each window's high-low range should be smaller than the previous.
+    Requires at least 2 of the 3 contractions to be valid (more lenient).
+    Also checks that volume is declining across windows.
+    """
+    try:
+        if len(df) < 15:
+            return False, 0, None
+
+        bars = df.tail(15)
+
+        # Split into three 5-week windows
+        w1 = bars.iloc[0:5]
+        w2 = bars.iloc[5:10]
+        w3 = bars.iloc[10:15]
+
+        r1 = float(w1["High"].max() - w1["Low"].min())
+        r2 = float(w2["High"].max() - w2["Low"].min())
+        r3 = float(w3["High"].max() - w3["Low"].min())
+
+        v1 = float(w1["Volume"].mean())
+        v2 = float(w2["Volume"].mean())
+        v3 = float(w3["Volume"].mean())
+
+        # Count range contractions (each window tighter than previous)
+        range_contractions = sum([r2 < r1, r3 < r2])
+        vol_contractions   = sum([v2 < v1, v3 < v2])
+
+        # Need at least 1 range contraction and 1 volume contraction
+        if range_contractions < 1 or vol_contractions < 1:
+            return False, 0, None
+
+        # Pivot = highest high in the last 10 weeks
+        pivot        = float(df["High"].tail(10).max())
+        contractions = range_contractions + vol_contractions
+
+        return True, contractions, pivot
+
+    except Exception:
+        return False, 0, None
 
 
-def contraction_volume_pattern(df):
-    ranges  = (df["High"] - df["Low"]).values[-5:-2]
-    volumes = df["Volume"].values[-5:-2]
-    if len(ranges) < 3:
+def tightening(df):
+    """
+    Recent closes should be getting tighter (lower standard deviation).
+    Compare std of last 4 weeks vs prior 8 weeks.
+    """
+    try:
+        recent = df["Close"].tail(4)
+        prior  = df["Close"].tail(12).head(8)
+        recent_std = float(recent.std() / recent.mean())
+        prior_std  = float(prior.std()  / prior.mean())
+        return recent_std < prior_std
+    except Exception:
         return False
-    return (
-        ranges[0]  > ranges[1]  > ranges[2]
-        and volumes[0] > volumes[1] > volumes[2]
-    )
-
-
-def tight_area(df):
-    closes    = df["Close"].tail(3)
-    pct_range = (float(closes.max()) - float(closes.min())) / float(closes.mean())
-    return pct_range < 0.03
 
 
 def volume_dryup(df):
-    recent   = float(df["Volume"].tail(3).mean())
-    previous = float(df["Volume"].tail(12).head(9).mean())
-    return recent < previous if previous > 0 else False
+    """Recent 3-week volume below the prior 9-week average."""
+    try:
+        recent   = float(df["Volume"].tail(3).mean())
+        previous = float(df["Volume"].tail(12).head(9).mean())
+        return recent < previous * 0.9 if previous > 0 else False
+    except Exception:
+        return False
 
 
 def is_breaking_out(df, pivot):
-    latest  = df.iloc[-1]
-    avg_vol = float(df["Volume"].tail(10).mean())
-    return (
-        float(latest["High"]) > pivot
-        and float(latest["Volume"]) > avg_vol * 1.5
-    )
+    """Latest week closed above pivot on above-average volume."""
+    try:
+        latest  = df.iloc[-1]
+        avg_vol = float(df["Volume"].tail(10).mean())
+        return (
+            float(latest["Close"]) > pivot
+            and float(latest["Volume"]) > avg_vol * 1.3
+        )
+    except Exception:
+        return False
 
 # ─────────────────────────────────────────
-#  SCORING
+#  SCORING  (0–100 scale)
 # ─────────────────────────────────────────
 
 def score_setup(df, spy, contractions, pct_from_pivot):
-    rs    = relative_strength(df, spy)
-    score = (
-        contractions           * 20
-        + (1 - pct_from_pivot) * 40
-        + rs                   * 20
-        + (10 if volume_dryup(df) else 0)
-        + (10 if tight_area(df)   else 0)
-    )
-    return round(score, 2)
+    rs         = relative_strength(df, spy)
+    vol_score  = 15 if volume_dryup(df)  else 0
+    tight_score= 15 if tightening(df)    else 0
+    rs_score   = min(rs * 20, 30)        # cap at 30
+    prox_score = max(0, (1 - pct_from_pivot / MAX_PIVOT_DISTANCE)) * 25
+    cont_score = min(contractions * 5, 15)
+    return round(rs_score + prox_score + cont_score + vol_score + tight_score, 1)
 
 # ─────────────────────────────────────────
 #  HTML + JSON OUTPUT
@@ -248,11 +308,10 @@ def score_setup(df, spy, contractions, pct_from_pivot):
 def export_html(results, scanned):
     now  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     rows = ""
-
     for rank, r in enumerate(results, 1):
-        ticker  = r["Ticker"]
-        badge   = ' <span style="color:#00ff88;font-weight:bold">⚡ BREAKOUT</span>' if r.get("Breakout") else ""
-        chart   = (
+        ticker = r["Ticker"]
+        badge  = ' <span style="color:#00ff88;font-weight:bold">⚡ BREAKOUT</span>' if r.get("Breakout") else ""
+        chart  = (
             f'<iframe width="420" height="260" '
             f'src="https://s.tradingview.com/widgetembed/?symbol={ticker}'
             f'&interval=W&theme=dark" frameborder="0"></iframe>'
@@ -304,11 +363,10 @@ def export_html(results, scanned):
 
     with open("results.html", "w", encoding="utf-8") as f:
         f.write(html)
-
     with open("results.json", "w", encoding="utf-8") as f:
         json.dump({"last_scan": now, "scanned": scanned, "results": results}, f, indent=2)
 
-    log.info("Exported %d candidates to results.html + results.json", len(results))
+    log.info("Exported %d candidates", len(results))
 
 # ─────────────────────────────────────────
 #  FTP UPLOAD
@@ -355,11 +413,10 @@ def run_scan(symbols, spy):
             time.sleep(5)
             continue
 
-        time.sleep(2)
+        time.sleep(1)
 
         for symbol in batch:
             scanned += 1
-
             try:
                 df = extract_ticker(raw, symbol, batch)
                 if df is None:
@@ -368,24 +425,16 @@ def run_scan(symbols, spy):
             except Exception:
                 continue
 
-            if len(df) < MIN_WEEKS:
-                continue
-            if not liquidity_ok(df):
-                continue
-            if not stage2(df):
-                continue
-            if not prior_uptrend(df):
-                continue
+            if len(df) < MIN_WEEKS:      continue
+            if not liquidity_ok(df):     continue
+            if not stage2(df):           continue
+            if not prior_uptrend(df):    continue
 
             is_vcp, contractions, pivot = detect_vcp(df)
-
-            if not is_vcp:
-                continue
-            if not contraction_volume_pattern(df):
-                continue
+            if not is_vcp:               continue
 
             close          = float(df["Close"].iloc[-1])
-            pct_from_pivot = (pivot - close) / pivot
+            pct_from_pivot = (pivot - close) / pivot if pivot > 0 else 1.0
 
             if pct_from_pivot > MAX_PIVOT_DISTANCE:
                 continue
@@ -407,25 +456,36 @@ def run_scan(symbols, spy):
                 breakout_alerts.append(entry)
                 log.info("  ⚡ BREAKOUT  %s  pivot=%.2f  score=%.1f", symbol, pivot, score)
             else:
-                log.info("  VCP forming  %s  score=%.1f  %.1f%% from pivot", symbol, score, pct_from_pivot * 100)
+                log.info("  VCP forming  %s  score=%.1f  %.1f%% from pivot",
+                         symbol, score, pct_from_pivot * 100)
 
-    # ── Telegram alerts ──────────────────
+    # ── Telegram ─────────────────────────
     if breakout_alerts:
         lines = ["🚨 VCP BREAKOUT ALERT\n"]
         for r in breakout_alerts:
-            lines.append(f"• {r['Ticker']}  pivot={r['Pivot']}  score={r['Score']}  ({r['PctFromPivot']}% from pivot)")
+            lines.append(
+                f"• {r['Ticker']}  pivot={r['Pivot']}  "
+                f"score={r['Score']}  ({r['PctFromPivot']}% from pivot)"
+            )
         lines.append(f"\n{datetime.now(timezone.utc).strftime('%H:%M UTC')}")
         send_telegram("\n".join(lines))
 
-    elif results:
-        top   = sorted(results, key=lambda x: x["Score"], reverse=True)[:5]
+    if results:
+        top   = sorted(results, key=lambda x: x["Score"], reverse=True)[:8]
         lines = [f"📊 Scan complete — {len(results)} VCP setups forming\n"]
         for r in top:
-            lines.append(f"• {r['Ticker']}  score={r['Score']}  ({r['PctFromPivot']}% from pivot)")
+            flag = "⚡ " if r.get("Breakout") else ""
+            lines.append(
+                f"{flag}• {r['Ticker']}  score={r['Score']}  "
+                f"({r['PctFromPivot']}% from pivot)"
+            )
         send_telegram("\n".join(lines))
-
     else:
-        send_telegram("📊 Scan complete — no VCP setups found this pass.")
+        send_telegram(
+            f"📊 Scan complete — 0 setups found.\n"
+            f"Scanned {scanned} stocks.\n"
+            f"{datetime.now(timezone.utc).strftime('%H:%M UTC')}"
+        )
 
     results.sort(key=lambda x: x["Score"], reverse=True)
     export_html(results, scanned)
